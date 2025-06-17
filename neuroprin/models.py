@@ -6,8 +6,14 @@ Includes:
 - DPLSTM (with custom DPLSTMCell)
 - BaselineLSTM
 - PRIN_LSTM (with attention, predictive coding, optional spiking)
+- DPRIN_LSTM (with dynamic pruning)
 - TemporalConvBlock
 - FourierTransformLayer
+- FeatureResonanceGating (v4 adaptive feature pruning)
+- ChaosGating (v4 chaos-based scaling)
+- TemporalAttention (v4 time-step pruning)
+- RegimeEmbedding (v4 regime-aware embedding)
+- NeuroPRINv4 (v4 core model)
 - DirectionalMSELoss
 """
 import math
@@ -16,23 +22,65 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DPLSTMCell(nn.Module):
-    """
-    Enhanced Adaptive Gated DPLSTM Cell.
-    Learns context-dependent recurrence strengths dynamically.
-    """
-    def __init__(self, input_size: int, hidden_size: int):
+class FeatureResonanceGating(nn.Module):
+    """Adaptive feature pruning via learned resonance gates."""
+    def __init__(self, input_size: int, prune_rate: float = 0.3):
         super().__init__()
         self.input_size = input_size
-        self.hidden_size = hidden_size
+        self.prune_rate = prune_rate
+        self.gates = nn.Parameter(torch.ones(input_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gates
+
+    def hard_prune(self) -> None:
+        with torch.no_grad():
+            threshold = torch.quantile(self.gates.abs(), self.prune_rate)
+            mask = (self.gates.abs() >= threshold).float()
+            self.gates.data *= mask
+
+
+class ChaosGating(nn.Module):
+    """Chaos-inspired gating to scale features by a chaos score."""
+    def __init__(self, input_size: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.ones(input_size))
+
+    def forward(self, x, chaos_score):
+        scale = 1 + 0.1 * chaos_score.unsqueeze(-1).unsqueeze(-1)
+        return x * self.gate * scale
+
+
+
+class TemporalAttention(nn.Module):
+    """Soft attention weighting across time steps for dynamic pruning."""
+    def __init__(self, seq_len: int):
+        super().__init__()
+        self.seq_weights = nn.Parameter(torch.ones(seq_len))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = F.softmax(self.seq_weights, dim=0)
+        return x * weights.unsqueeze(0).unsqueeze(-1)
+
+
+class RegimeEmbedding(nn.Module):
+    """Embed discrete regime states (from HMM) into a continuous space."""
+    def __init__(self, num_regimes: int, embed_size: int):
+        super().__init__()
+        self.embed = nn.Embedding(num_regimes, embed_size)
+
+    def forward(self, regimes: torch.LongTensor) -> torch.Tensor:
+        return self.embed(regimes)
+
+
+class DPLSTMCell(nn.Module):
+    """Enhanced Adaptive Gated DPLSTM Cell."""
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
         self.W_ih = nn.Linear(input_size, 4 * hidden_size)
         self.W_hh = nn.Linear(hidden_size, 4 * hidden_size)
-
-        # Adaptive gating mechanism
-        self.adaptive_gate = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.Sigmoid()
-        )
+        self.adaptive_gate = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.Sigmoid())
+        self.hidden_size = hidden_size
 
     def forward(self, x: torch.Tensor, hx: tuple):
         h, c = hx
@@ -42,19 +90,14 @@ class DPLSTMCell(nn.Module):
         f = torch.sigmoid(forgetgate)
         g = torch.tanh(cellgate)
         o = torch.sigmoid(outgate)
-
-        # Adaptive gating on forget/input interaction
         adaptive_strength = self.adaptive_gate(h)
         c_new = adaptive_strength * (f * c) + (1 - adaptive_strength) * (i * g)
         h_new = o * torch.tanh(c_new)
-
         return h_new, c_new
 
 
 class DPLSTM(nn.Module):
-    """
-    Stacked DPLSTM layers.
-    """
+    """Stacked DPLSTM layers."""
     def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, batch_first: bool = True):
         super().__init__()
         self.hidden_size = hidden_size
@@ -66,12 +109,7 @@ class DPLSTM(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor, hx: tuple = None):
-        # x: (batch, seq, feature) if batch_first
-        if self.batch_first:
-            batch, seq_len, _ = x.size()
-        else:
-            seq_len, batch, _ = x.size()
-        # init states
+        batch, seq_len, _ = x.size() if self.batch_first else (x.size(1), x.size(0), x.size(2))
         if hx is None:
             h = [x.new_zeros(batch, self.hidden_size) for _ in range(self.num_layers)]
             c = [x.new_zeros(batch, self.hidden_size) for _ in range(self.num_layers)]
@@ -91,130 +129,63 @@ class DPLSTM(nn.Module):
 
 
 class BaselineLSTM(nn.Module):
-    """
-    Enhanced Baseline LSTM with residual connections and feed-forward refinement.
-    """
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int,
-        num_layers: int = 1,
-        dropout_p: float = 0.3
-    ):
+    """Enhanced Baseline LSTM with residual connections and feed-forward refinement."""
+    def __init__(self, input_size: int, hidden_size: int, output_size: int, num_layers: int = 1, dropout_p: float = 0.3):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size, hidden_size, num_layers,
-            batch_first=True, dropout=dropout_p
-        )
-        self.residual_fc = nn.Linear(input_size, hidden_size)  # residual path matching hidden size
-        self.refine_fc = nn.Sequential(  # feed-forward refinement
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_size)
-        )
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_p)
+        self.residual_fc = nn.Linear(input_size, hidden_size)
+        self.refine_fc = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU(), nn.Linear(hidden_size, output_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)
-
-        # Residual connection from input projection
         residual = self.residual_fc(x[:, -1, :])
-
-        out = out[:, -1, :] + residual
-
-        # Refinement layer
-        refined_output = self.refine_fc(out)
-
-        return refined_output
+        return self.refine_fc(out[:, -1, :] + residual)
 
 
 class SelfAttention(nn.Module):
-    """
-    Self-attention mechanism.
-    AdaptiveMultiHeadAttention
-    Multi-Head Self-Attention with Adaptive Head Importance.
-    Dynamically scales each head's influence based on learned signal strength.
-    """
+    """Multi-Head Self-Attention with Adaptive Head Importance."""
     def __init__(self, embed_dim: int, num_heads: int = 4):
         super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert embed_dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-
         self.query = nn.Linear(embed_dim, embed_dim)
         self.key = nn.Linear(embed_dim, embed_dim)
         self.value = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
-
-        # Adaptive scaling parameters per head
         self.head_scaling = nn.Parameter(torch.ones(num_heads))
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, embed_dim = x.size()
-
+        batch_size, seq_len, _ = x.size()
         Q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1,2)
         K = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1,2)
         V = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1,2)
-
         scores = (Q @ K.transpose(-2, -1)) * self.scale
-        attn_weights = torch.softmax(scores, dim=-1)
-
-        # Adaptive scaling per head (learned resonance per head)
-        head_importance = torch.softmax(self.head_scaling, dim=0).view(1, self.num_heads, 1, 1)
-        attn_weights = attn_weights * head_importance
-
-        attn_output = attn_weights @ V
-        attn_output = attn_output.transpose(1,2).contiguous().view(batch_size, seq_len, embed_dim)
-
-        return self.out_proj(attn_output)
-
-
+        attn = torch.softmax(scores, dim=-1)
+        head_imp = torch.softmax(self.head_scaling, dim=0).view(1, self.num_heads, 1, 1)
+        attn = attn * head_imp
+        out = (attn @ V).transpose(1,2).contiguous().view(batch_size, seq_len, -1)
+        return self.out_proj(out)
 
 
 class PredictiveCodingLayer(nn.Module):
-    """
-    Predictive coding: learns to predict and computes error.
-    HierarchicalPredictiveCodingLayer
-    Hierarchical Predictive Coding Layer with feedback integration.
-    Uses multiple prediction horizons for richer temporal understanding.
-    """
+    """Hierarchical Predictive Coding Layer with feedback integration."""
     def __init__(self, dim: int, horizons: int = 3):
         super().__init__()
-        self.horizons = horizons
-        self.pred_layers = nn.ModuleList([
-            nn.Linear(dim, dim) for _ in range(horizons)
-        ])
-        self.feedback_layer = nn.Linear(dim * horizons, dim)
+        self.pred_layers = nn.ModuleList([nn.Linear(dim, dim) for _ in range(horizons)])
+        self.feedback_layer = nn.Linear(dim*horizons, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         preds = [layer(x) for layer in self.pred_layers]
-
-        # Combine multi-horizon predictions
-        combined_preds = torch.cat(preds, dim=-1)
-        feedback = torch.tanh(self.feedback_layer(combined_preds)).clamp(-5.0, 5.0)
-
-
-        # Compute predictive coding error using hierarchical feedback
-        error = x - feedback
-        return error
-
+        combined = torch.cat(preds, dim=-1)
+        feedback = torch.tanh(self.feedback_layer(combined)).clamp(-5,5)
+        return x - feedback
 
 
 class SpikingLayer(nn.Module):
-    """
-    Spiking Layer: Spiking neuron layer.    
-    AdaptiveSpikingLayer
-    Adaptive Spiking Neuron Layer.
-    Dynamically adjusts firing thresholds based on recent activity.
-    """
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        initial_threshold: float = 1.0,
-        adaptation_rate: float = 0.05
-    ):
+    """Adaptive Spiking Neuron Layer."""
+    def __init__(self, input_dim: int, output_dim: int, initial_threshold: float=1.0, adaptation_rate: float=0.05):
         super().__init__()
         self.fc = nn.Linear(input_dim, output_dim)
         self.threshold = nn.Parameter(torch.full((output_dim,), initial_threshold))
@@ -224,260 +195,152 @@ class SpikingLayer(nn.Module):
         mem = torch.zeros(x.size(0), self.fc.out_features, device=x.device)
         spikes = []
         for t in range(x.size(1)):
-            out = self.fc(x[:, t, :])
+            out = self.fc(x[:,t,:])
             mem += out
-            current_spikes = (mem >= self.threshold).float()
-            spikes.append(current_spikes.unsqueeze(1))
-            # Threshold adaptation (Hebbian-like update)
-            threshold_update = self.adaptation_rate * (current_spikes.mean(dim=0) - 0.5)
-            self.threshold.data.add_(threshold_update.to(self.threshold.device))
-            mem *= (1 - current_spikes)  # reset membrane potential on spike
+            s = (mem>=self.threshold).float()
+            spikes.append(s.unsqueeze(1))
+            self.threshold.data.add_(self.adaptation_rate*(s.mean(dim=0)-0.5).to(self.threshold.device))
+            mem *= (1-s)
         return torch.cat(spikes, dim=1)
 
 
 class DPRIN_LSTM(nn.Module):
-    """
-    Dynamic PRIN LSTM: incorporates RigL-style weight pruning and regrowth
-    on the recurrent and input-to-hidden weight matrices at each forward pass,
-    combined with attention and predictive coding.
-    """
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int,
-        num_layers: int = 1,
-        prune_rate: float = 0.01,
-        dropout_p: float = 0.5,
-        use_snn: bool = False
-    ):
+    """Dynamic PRIN LSTM with RigL weight pruning/regrowth."""
+    def __init__(self, input_size:int, hidden_size:int, output_size:int, num_layers:int=1, prune_rate:float=0.01, dropout_p:float=0.5, use_snn:bool=False):
         super().__init__()
         self.prune_rate = prune_rate
-        self.lstm = nn.LSTM(
-            input_size, hidden_size, num_layers,
-            batch_first=True, dropout=dropout_p
-        )
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_p)
         self.attn = SelfAttention(hidden_size)
         self.pc = PredictiveCodingLayer(hidden_size)
         self.dropout = nn.Dropout(dropout_p)
-        if use_snn:
-            self.fc = SpikingLayer(hidden_size, output_size)
-        else:
-            self.fc = nn.Linear(hidden_size, output_size)
-        self.use_snn = use_snn
+        self.fc = SpikingLayer(hidden_size, output_size) if use_snn else nn.Linear(hidden_size, output_size)
 
-    def _rigl_prune_and_regrow(self, weight: torch.Tensor) -> None:
-        """
-        In-place RigL pruning/regrowth on a weight tensor:
-        - Prune the lowest-magnitude prune_rate fraction
-        - Regrow random connections at the same fraction
-        """
-        # Compute threshold for pruning
+    def _rigl_prune_and_regrow(self, weight:torch.Tensor):
         flat = weight.abs().flatten()
-        k = int(flat.numel() * self.prune_rate)
-        if k < 1:
-            return
-        threshold = torch.topk(flat, k, largest=False).values.max()
-        # Prune
-        mask = weight.abs() >= threshold
-        pruned = weight * mask
-        # Regrow
-        regrow_mask = (~mask) & (torch.rand_like(weight) < self.prune_rate)
-        pruned[regrow_mask] = torch.randn_like(pruned[regrow_mask]) * 0.01
+        k = int(flat.numel()*self.prune_rate)
+        if k<1: return
+        thresh = torch.topk(flat,k,largest=False).values.max()
+        mask = weight.abs()>=thresh
+        pruned = weight*mask
+        regrow = (~mask)&(torch.rand_like(weight)<self.prune_rate)
+        pruned[regrow] = torch.randn_like(pruned[regrow])*0.01
         weight.data.copy_(pruned)
 
     def _apply_dynamic_pruning(self):
-        """
-        Apply RigL-style pruning/regrowth to all LSTM weight matrices.
-        """
-        for name, param in self.lstm.named_parameters():
+        for name,param in self.lstm.named_parameters():
             if 'weight_ih' in name or 'weight_hh' in name:
                 self._rigl_prune_and_regrow(param.data)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq, feature)
-        # 1) Dynamic pruning/regrowth on LSTM weights
+    def forward(self, x:torch.Tensor)->torch.Tensor:
         self._apply_dynamic_pruning()
-
-        # 2) Standard LSTM forward
-        out, _ = self.lstm(x)
-
-        # 3) Attention + predictive coding
+        out,_ = self.lstm(x)
         att = self.attn(out)
         err = self.pc(att)
-        combined = self.dropout(out + err)
-
-        # 4) Take last time-step and output
-        last = combined[:, -1, :]
-        return self.fc(last)
+        combined = self.dropout(out+err)
+        return self.fc(combined[:,-1,:])
 
 
 class PRIN_LSTM(nn.Module):
-    """
-    PRIN LSTM with pruning, attention, predictive coding, optional spiking output.
-    """
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int,
-        num_layers: int = 1,
-        pruning_threshold: float = 0.01,
-        dropout_p: float = 0.5,
-        use_snn: bool = False
-    ):
+    """PRIN LSTM with DPLSTM core, attention, predictive coding, optional spiking."""
+    def __init__(self, input_size:int, hidden_size:int, output_size:int, num_layers:int=1, pruning_threshold:float=0.01, dropout_p:float=0.5, use_snn:bool=False):
         super().__init__()
         self.pruning_threshold = pruning_threshold
         self.lstm = DPLSTM(input_size, hidden_size, num_layers)
         self.attn = SelfAttention(hidden_size)
         self.pc = PredictiveCodingLayer(hidden_size)
         self.dropout = nn.Dropout(dropout_p)
-        if use_snn:
-            self.fc = SpikingLayer(hidden_size, output_size)
-        else:
-            self.fc = nn.Linear(hidden_size, output_size)
-        self.use_snn = use_snn
-        self.hidden = None
+        self.fc = SpikingLayer(hidden_size, output_size) if use_snn else nn.Linear(hidden_size, output_size)
+        self.hidden=None
 
-    def reset_hidden(self, batch: int, device: torch.device) -> None:
-        h0 = torch.zeros(self.lstm.num_layers, batch, self.lstm.hidden_size, device=device)
-        c0 = torch.zeros_like(h0)
-        self.hidden = (h0, c0)
+    def reset_hidden(self,batch:int,device:torch.device):
+        h0=torch.zeros(self.lstm.num_layers,batch,self.lstm.hidden_size,device=device)
+        c0=torch.zeros_like(h0)
+        self.hidden=(h0,c0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq, feature)
-        if self.hidden is None or self.hidden[0].size(1) != x.size(0):
-            self.reset_hidden(x.size(0), x.device)
-        out, self.hidden = self.lstm(x, self.hidden)
-        # pruning
-        mask = (out.abs() > self.pruning_threshold).float()
-        out = out * mask
-        # attention + predictive coding
-        att = self.attn(out)
-        err = self.pc(att)
-        combined = self.dropout(out + err)
-        # take last step
-        last = combined[:, -1, :]
-        return self.fc(last)
+    def forward(self,x:torch.Tensor)->torch.Tensor:
+        if self.hidden is None or self.hidden[0].size(1)!=x.size(0):
+            self.reset_hidden(x.size(0),x.device)
+        out,self.hidden=self.lstm(x,self.hidden)
+        mask=(out.abs()>self.pruning_threshold).float()
+        out=out*mask
+        att=self.attn(out)
+        err=self.pc(att)
+        combined=self.dropout(out+err)
+        return self.fc(combined[:,-1,:])
 
 
 class TemporalConvBlock(nn.Module):
-    """
-    Residual temporal convolution block.
-    GatedTemporalConvBlock
-    Gated Residual Temporal Convolutional Block.
-    Enhances temporal modeling by selectively gating information flow.
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int = 1
-    ):
+    """Gated Residual Temporal Convolutional Block."""
+    def __init__(self,in_ch:int,out_ch:int,kernel_size:int,dilation:int=1):
         super().__init__()
-        padding = (kernel_size - 1) * dilation // 2
+        padding=(kernel_size-1)*dilation//2
+        self.conv_filter=nn.Conv1d(in_ch,out_ch,kernel_size,padding=padding,dilation=dilation)
+        self.conv_gate=nn.Conv1d(in_ch,out_ch,kernel_size,padding=padding,dilation=dilation)
+        self.dropout=nn.Dropout(0.2)
+        self.residual=nn.Conv1d(in_ch,out_ch,1) if in_ch!=out_ch else nn.Identity()
 
-        self.conv_filter = nn.Conv1d(in_channels, out_channels, kernel_size,
-                                     padding=padding, dilation=dilation)
-        self.conv_gate = nn.Conv1d(in_channels, out_channels, kernel_size,
-                                   padding=padding, dilation=dilation)
-
-        self.dropout = nn.Dropout(0.2)
-
-        # Adaptive residual connection
-        self.residual = (nn.Conv1d(in_channels, out_channels, kernel_size=1)
-                         if in_channels != out_channels else nn.Identity())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, channels, seq)
-        filter_out = torch.tanh(self.conv_filter(x))
-        gate_out = torch.sigmoid(self.conv_gate(x))
-        gated_out = filter_out * gate_out
-
-        gated_out = self.dropout(gated_out)
-
-        res = self.residual(x)
-
-        return gated_out + res
+    def forward(self,x:torch.Tensor)->torch.Tensor:
+        f=torch.tanh(self.conv_filter(x))
+        g=torch.sigmoid(self.conv_gate(x))
+        out=f*g
+        out=self.dropout(out)
+        return out+self.residual(x)
 
 
 class FourierTransformLayer(nn.Module):
-    """
-    FFT-based feature expansion.
-    FourierMagnitudePhaseLayer
-    Enhanced FFT-based layer capturing magnitude and phase explicitly.
-    Useful for detecting resonant frequency patterns explicitly.
-    """
-    def __init__(self, use_fourier: bool = True, log_magnitude: bool = True):
+    """FFT-based feature expansion capturing magnitude & phase."""
+    def __init__(self,use_fourier:bool=True,log_magnitude:bool=True):
         super().__init__()
-        self.use_fourier = use_fourier
-        self.log_magnitude = log_magnitude
+        self.use_fourier=use_fourier
+        self.log_magnitude=log_magnitude
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq, feature)
+    def forward(self,x:torch.Tensor)->torch.Tensor:
         if not self.use_fourier:
             return x
-
-        fft = torch.fft.rfft(x, dim=1)
-        
-        magnitude = torch.abs(fft)
-        phase = torch.angle(fft)
-
+        fft=torch.fft.rfft(x,dim=1)
+        mag=torch.abs(fft)
+        phase=torch.angle(fft)
         if self.log_magnitude:
-            magnitude = torch.log1p(magnitude)
+            mag=torch.log1p(mag)
+        return torch.cat([mag,phase],dim=-1)
 
-        return torch.cat([magnitude, phase], dim=-1)
 
+class NeuroPRINv4(nn.Module):
+    """NeuroPRIN v4 core model with multi-level adaptive pruning."""
+    def __init__(self, input_size:int, seq_len:int, num_regimes:int, hidden_size:int=64, regime_embed_size:int=8, prune_rate:float=0.3):
+        super().__init__()
+        self.feature_gate = FeatureResonanceGating(input_size, prune_rate)
+        self.chaos_gate = ChaosGating(input_size)
+        self.temporal_attn = TemporalAttention(seq_len)
+        self.regime_embed = RegimeEmbedding(num_regimes, regime_embed_size)
+        self.lstm = nn.LSTM(input_size+regime_embed_size, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(hidden_size, hidden_size//2)
+        self.fc2 = nn.Linear(hidden_size//2, 1)
+
+    def forward(self, x:torch.Tensor, chaos_score:torch.Tensor, regime_state:torch.LongTensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        x = self.feature_gate(x)
+        x = self.chaos_gate(x, chaos_score)
+        x = self.temporal_attn(x)
+        regimes = self.regime_embed(regime_state)
+        regimes = regimes.unsqueeze(1).repeat(1, T, 1)
+        x = torch.cat([x, regimes], dim=-1)
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        out = self.dropout(out)
+        out = F.relu(self.fc1(out))
+        return self.fc2(out)
 
 
 class DirectionalMSELoss(nn.Module):
-    """
-    Enhanced Directional MSE Loss:
-    Combines MSE, directional accuracy, adaptive variance regularization,
-    and asymmetric penalty for predictions, optimizing for precise resonance inference.
-    """
-    def __init__(
-        self,
-        alpha: float = 0.01,
-        epsilon: float = 1e-6,
-        direction_weight: float = 0.1,
-        asymmetry_factor: float = 2.0
-    ):
+    """MSE loss weighted by directional accuracy."""
+    def __init__(self, alpha:float=1.0):
         super().__init__()
         self.alpha = alpha
-        self.epsilon = epsilon
-        self.direction_weight = direction_weight
-        self.asymmetry_factor = asymmetry_factor
         self.mse = nn.MSELoss()
 
-    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Standard MSE component
-        mse_loss = self.mse(preds, targets)
-
-        # Directional accuracy (encourages predicting correct direction of change)
-        pred_diff = preds[1:] - preds[:-1]
-        target_diff = targets[1:] - targets[:-1]
-
-        pred_sign = torch.sign(pred_diff)
-        target_sign = torch.sign(target_diff)
-
-        directional_accuracy = (pred_sign == target_sign).float().mean()
-        directional_penalty = (1 - directional_accuracy) * self.direction_weight
-
-        # Adaptive variance regularization (based on recent error)
-        pred_std = preds.std(unbiased=False)
-        variance_reg = -self.alpha * torch.log(pred_std + self.epsilon)
-
-        # Asymmetric penalty (heavier penalty for underestimations or overestimations)
-        residuals = preds - targets
-        asymmetric_penalty = torch.where(
-            residuals > 0,
-            residuals ** 2,
-            self.asymmetry_factor * (residuals ** 2)
-        ).mean()
-
-        # Combine all components
-        total_loss = mse_loss + directional_penalty + variance_reg + asymmetric_penalty
-
-        return total_loss
+    def forward(self, pred:torch.Tensor, target:torch.Tensor) -> torch.Tensor:
+        base = self.mse(pred, target)
+        dir_acc = ((pred[1:]-pred[:-1])*(target[1:]-target[:-1])>0).float().mean()
+        return base * (1 - self.alpha*dir_acc)

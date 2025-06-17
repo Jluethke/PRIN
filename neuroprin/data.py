@@ -1,194 +1,202 @@
-"""
-neuroprin/data.py
-
-Core data-loading, preprocessing, environment, and technical-indicator utilities for NeuroPRIN.
-"""
-import os
-from typing import List, Tuple
-
-import numpy as np
 import pandas as pd
-import yfinance as yf
-import gym
-from gym import spaces
-import pandas_ta as ta
+import numpy as np
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.feature_selection import mutual_info_regression
+from hmmlearn.hmm import GaussianHMM
 
 
-def load_price_data(
-    symbols: List[str],
-    start_date: str,
-    end_date: str,
-    interval: str = '1d',
-    cache_dir: str = None
-) -> pd.DataFrame:
+def load_price_data(filepath: str, index_col: str = 'Date', parse_dates: bool = True) -> pd.DataFrame:
     """
-    Download and cache OHLCV data for given symbols.
-
-    Returns a single DataFrame indexed by Datetime, with a MultiIndex columns (symbol, feature).
+    Load CSV price data, optionally parse dates and set index.
     """
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-    all_data = []
-    for symbol in symbols:
-        cache_file = os.path.join(cache_dir, f"{symbol}_{interval}.parquet") if cache_dir else None
-        if cache_file and os.path.exists(cache_file):
-            df = pd.read_parquet(cache_file)
-        else:
-            df = yf.download(symbol, start=start_date, end=end_date, interval=interval, progress=False)
-            if cache_file:
-                df.to_parquet(cache_file)
-        df['Symbol'] = symbol
-        all_data.append(df.reset_index())
-    df = pd.concat(all_data, ignore_index=True)
-    df.set_index(['Date', 'Symbol'], inplace=True)
-    df = df.sort_index()
+    if parse_dates and index_col in pd.read_csv(filepath, nrows=0).columns:
+        df = pd.read_csv(filepath, parse_dates=[index_col])
+    else:
+        df = pd.read_csv(filepath)
+    if index_col in df.columns:
+        df.set_index(index_col, inplace=True)
     return df
 
 
-def preprocess_data(
-    df: pd.DataFrame,
-    fill_method: str = 'ffill',
-    dropna_threshold: float = 0.9
-) -> pd.DataFrame:
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Basic preprocessing:
-    - Forward/backward fill missing values.
-    - Drop columns with more than dropna_threshold fraction missing.
-    - Drop remaining NaNs.
-    """
-    # Drop columns with too many NaNs
-    thresh = int(len(df) * dropna_threshold)
-    df = df.dropna(axis=1, thresh=thresh)
-    df = df.fillna(method=fill_method).dropna()
-    return df
-
-
-def compute_indicators(
-    df: pd.DataFrame,
-    adx_length: int = 14,
-    rsi_length: int = 14,
-    bb_length: int = 20,
-    bb_std: int = 2,
-    atr_length: int = 14,
-    volume_ma: int = 20
-) -> pd.DataFrame:
-    """
-    Compute common technical indicators and append as new columns:
-    - ADX, +DI, -DI
-    - RSI
-    - Bollinger Bands
-    - ATR
-    - Volume moving average
+    Fill missing values via forward and backward fill.
     """
     df = df.copy()
-    # ADX and directional indicators
-    adx = ta.adx(df['High'], df['Low'], df['Close'], length=adx_length)
-    df['ADX'] = adx[f'ADX_{adx_length}']
-    df['DI_PLUS'] = adx[f'DI_PLUS_{adx_length}']
-    df['DI_MINUS'] = adx[f'DI_MINUS_{adx_length}']
-    # RSI
-    df['RSI'] = ta.rsi(df['Close'], length=rsi_length)
+    return df.fillna(method='ffill').fillna(method='bfill')
 
-    # VWAP
-    df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
-    # Bollinger Bands
-    bb = ta.bbands(df['Close'], length=bb_length, std=bb_std)
-    df['BBL'] = bb[f'BBL_{bb_length}_{bb_std}.0']
-    df['BBM'] = bb[f'BBM_{bb_length}_{bb_std}.0']
-    df['BBU'] = bb[f'BBU_{bb_length}_{bb_std}.0']
-    # ATR
-    df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=atr_length)
-    # Volume moving average
-    df['VOL_MA'] = df['Volume'].rolling(volume_ma).mean()
-    # Drop any rows with NA after indicator computation
+
+
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute standard technical indicators on OHLCV data.
+    Adds SMA, EMA, ROC, Bollinger Bands, RSI, Stochastic %K, OBV.
+    """
+    df = df.copy()
+    if 'Close' in df:
+        df['SMA_10'] = df['Close'].rolling(10, min_periods=1).mean()
+        df['SMA_50'] = df['Close'].rolling(50, min_periods=1).mean()
+        df['EMA_10'] = df['Close'].ewm(span=10, adjust=False).mean()
+        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        df['ROC_10'] = df['Close'].pct_change(10)
+    if {'High','Low','Close'}.issubset(df.columns):
+        df['BB_upper'] = df['SMA_10'] + 2*df['Close'].rolling(10, min_periods=1).std()
+        df['BB_lower'] = df['SMA_10'] - 2*df['Close'].rolling(10, min_periods=1).std()
+        delta = df['Close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(14, min_periods=1).mean()
+        avg_loss = loss.rolling(14, min_periods=1).mean()
+        rs = avg_gain/(avg_loss + 1e-9)
+        df['RSI_14'] = 100 - 100/(1+rs)
+        low_14 = df['Low'].rolling(14, min_periods=1).min()
+        high_14 = df['High'].rolling(14, min_periods=1).max()
+        df['Stoch_%K'] = 100*(df['Close']-low_14)/(high_14-low_14 + 1e-9)
+    if 'Volume' in df:
+        df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    return df
+
+
+def compute_lyapunov_exponent(series: np.ndarray, window: int = 20, lag: int = 1) -> float:
+    """
+    Estimate a simple Lyapunov exponent for chaos measurement.
+    """
+    diffs = np.abs(series[lag:] - series[:-lag])
+    lyap = np.mean(np.log(diffs + 1e-10)) / lag
+    return max(lyap, 0.0)
+
+
+def prune_data(df: pd.DataFrame, method: str = 'adaptive', base_alpha: float = 1.5, base_beta: float = 1.5, window: int = 14) -> pd.DataFrame:
+    """
+    Prune outliers based on static or adaptive thresholds.
+    """
+    df = df.copy()
+    chaos = compute_lyapunov_exponent(df['Close'].values, window)
+    alpha = base_alpha * (1 + chaos)
+    beta = base_beta * (1 + chaos)
+    q_low, q_high = df['Close'].quantile([0.05,0.95])
+    extreme = (df['Close']<q_low)|(df['Close']>q_high)
+    if method=='static':
+        mu = df['Close'].rolling(window, min_periods=1).mean()
+        sigma = df['Close'].rolling(window, min_periods=1).std()
+        thresh = alpha * sigma
+        df['Pruned'] = np.where((np.abs(df['Close']-mu)>thresh)|extreme, df['Close'], 0)
+    else:
+        ema = df['Close'].ewm(span=window, adjust=False).mean()
+        atr = df['High'].rolling(window, min_periods=1).max() - df['Low'].rolling(window, min_periods=1).min()
+        thresh = beta * atr
+        df['Pruned'] = np.where((np.abs(df['Close']-ema)>thresh)|extreme, df['Close'], 0)
     return df.dropna()
 
 
-class StockTradingEnv(gym.Env):
+def compute_fourier_resonance(df: pd.DataFrame, window_size: int = 20) -> pd.DataFrame:
     """
-    A simple stock trading environment for OpenAI Gym.
-
-    Observation:
-        Type: Box(shape=(n_features,), dtype=np.float32)
-    Actions:
-        Type: Discrete(3)  # 0 = hold, 1 = buy, 2 = sell
-    Reward:
-        Profit and loss on each step.
+    Compute resonance scores over rolling windows.
     """
-    metadata = {'render.modes': ['human']}
+    df = df.copy()
+    features = [c for c in df.columns if c not in ['Pruned']]
+    arr = df[features].values
+    scores = np.zeros(len(arr))
+    for i in range(window_size, len(arr)):
+        w = arr[i-window_size:i]
+        wn = (w - w.mean(axis=0)) / (w.std(axis=0) + 1e-9)
+        fft_vals = np.abs(np.fft.fft(wn, axis=0))
+        ps = fft_vals.mean(axis=1)
+        scores[i] = ps[1:].max()
+    df['Resonance'] = scores
+    df['Resonance_Norm'] = (
+        (df['Resonance'] - df['Resonance'].rolling(50, min_periods=1).mean())
+        / (df['Resonance'].rolling(50, min_periods=1).std() + 1e-9)
+    )
+    return df.dropna()
 
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        initial_balance: float = 10000.0,
-        max_steps: int = None
-    ):
-        super().__init__()
-        self.df = df.reset_index()
-        self.symbols = self.df['Symbol'].unique().tolist()
-        # features: OHLCV plus indicators
-        self.feature_cols = [c for c in df.columns if c not in ['Symbol']]
-        self.n_features = len(self.feature_cols)
-        self.initial_balance = initial_balance
-        self.max_steps = max_steps or len(self.df)
 
-        # Define action and observation space
-        self.action_space = spaces.Discrete(3)
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_features + 2,), dtype=np.float32
-        )
+def compute_rqa_metrics(df: pd.DataFrame, window_size: int = 20) -> pd.DataFrame:
+    """
+    Compute recurrence rate metrics over rolling windows.
+    """
+    df = df.copy()
+    features = [c for c in df.columns if c not in ['Pruned','Resonance','Resonance_Norm']]
+    arr = df[features].values
+    rr = np.zeros(len(arr))
+    for i in range(window_size, len(arr)):
+        w = arr[i-window_size:i]
+        wn = (w - w.mean(0))/(w.std(0)+1e-9)
+        d = np.linalg.norm(wn[:,None]-wn[None,:],axis=2)
+        rr[i] = (d<0.1).mean()
+    df['Recurrence_Rate'] = rr
+    return df.dropna()
 
-    def reset(self) -> np.ndarray:
-        self.balance = self.initial_balance
-        self.position = 0  # number of shares held
-        self.current_step = 0
-        self.trades = []
-        return self._next_observation()
 
-    def _next_observation(self) -> np.ndarray:
-        row = self.df.iloc[self.current_step]
-        obs = row[self.feature_cols].values.astype(np.float32)
-        # Append current balance and position
-        return np.concatenate([obs, [self.balance, self.position]]).astype(np.float32)
+def prepare_sequences_with_prin_plus_plus(data_dict: dict, seq_length: int = 10,n_features: int = 5, n_regimes: int = 3):
+    """
+    Build sequences, compute MI-based feature selection, HMM regimes.
+    Returns X, y, resonance, recurrence, regimes, n_regimes.
+    """
+    X_seqs, y_list, res_list, rec_list, feat_list = [], [], [], [], []
+    for df in data_dict.values():
+        df_p = prune_data(df)
+        df_r = compute_fourier_resonance(df_p, window_size=seq_length)
+        df_q = compute_rqa_metrics(df_r, window_size=seq_length)
+        feats = df_q.select_dtypes(include=[np.number]).values
+        target = df_q['Close'].shift(-1).values
+        for i in range(len(df_q) - seq_length - 1):
+            X_seqs.append(feats[i:i+seq_length])
+            y_list.append(target[i+seq_length])
+            res_list.append(df_q['Resonance_Norm'].iloc[i+seq_length])
+            rec_list.append(df_q['Recurrence_Rate'].iloc[i+seq_length])
+            feat_list.append(feats[i+seq_length])
+    X = np.array(X_seqs)
+    y = np.array(y_list)
+    resonance = np.array(res_list)
+    recurrence = np.array(rec_list)
+    all_feats = np.array(feat_list)
+    # Mutual information feature selection
+    mi = mutual_info_regression(all_feats, y)
+    idx = np.argsort(mi)[-n_features:]
+    selected_feats = all_feats[:, idx]
+    # HMM regime classification
+    hmm = GaussianHMM(n_components=n_regimes, covariance_type='full', n_iter=100)
+    hmm.fit(selected_feats)
+    regimes = hmm.predict(selected_feats)
+    return X, y, resonance, recurrence, regimes, n_regimes
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
-        assert self.action_space.contains(action)
-        row = self.df.iloc[self.current_step]
-        price = row['Close']
-        reward = 0.0
 
-        # Execute action
-        if action == 1:  # buy
-            if self.balance >= price:
-                self.position += 1
-                self.balance -= price
-                self.trades.append((self.current_step, 'buy', price))
-        elif action == 2:  # sell
-            if self.position > 0:
-                self.position -= 1
-                self.balance += price
-                self.trades.append((self.current_step, 'sell', price))
+class StockTradingEnv:
+    """
+    Simple trading environment to iterate over time-series data.
+    State: window of previous observations.
+    Action: buy (1), hold (0), sell (-1).
+    Reward: change in price * position.
+    """
+    def __init__(self, data: pd.DataFrame, window_size: int):
+        self.data = data.reset_index(drop=True)
+        self.window_size = window_size
+        self.reset()
 
-        # Calculate reward as change in net worth
-        net_worth = self.balance + self.position * price
-        if self.current_step > 0:
-            prev_row = self.df.iloc[self.current_step - 1]
-            prev_price = prev_row['Close']
-            prev_net = self.balance + self.position * prev_price
-            reward = net_worth - prev_net
+    def reset(self):
+        self.current_step = self.window_size
+        self.position = 0  # 1 for long, -1 for short, 0 for flat
+        self.total_reward = 0.0
+        # initial state window
+        return self.data.iloc[self.current_step-self.window_size:self.current_step]
 
+    def step(self, action: int):
+        # Clip action to {-1,0,1}
+        action = max(-1, min(1, action))
+        prev_price = self.data['Close'].iloc[self.current_step-1]
+        curr_price = self.data['Close'].iloc[self.current_step]
+        # compute reward: position * price change
+        reward = self.position * (curr_price - prev_price)
+        self.total_reward += reward
+        # update position
+        self.position = action
+        # advance step
         self.current_step += 1
-        done = self.current_step >= self.max_steps
-        obs = self._next_observation() if not done else None
-        info = {'net_worth': net_worth}
-        return obs, reward, done, info
+        done = self.current_step >= len(self.data)
+        state = None
+        if not done:
+            state = self.data.iloc[self.current_step-self.window_size:self.current_step]
+        return state, reward, done, {}
 
-    def render(self, mode='human'):
-        net_worth = self.balance + self.position * self.df.iloc[self.current_step - 1]['Close']
-        print(
-            f"Step: {self.current_step}, Balance: {self.balance:.2f}, "
-            f"Position: {self.position}, Net worth: {net_worth:.2f}"
-        )
-
-    def close(self):
-        pass

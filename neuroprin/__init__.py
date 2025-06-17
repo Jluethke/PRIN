@@ -18,7 +18,6 @@ from .models import (
     BaselineLSTM,
     TemporalConvBlock,
     FourierTransformLayer,
-    DirectionalMSELoss,
 )
 
 # Data loading and preprocessing
@@ -43,6 +42,7 @@ from .utils import (
     compute_acceleration_signal,
     measure_inference_latency,
     save_run_metadata,
+    DirectionalMSELoss,
 )
 
 __all__ = [

@@ -1,245 +1,318 @@
-#!/usr/bin/env python3
-"""
-examples/gui.py
-
-Graphical interface for NeuroPRIN demos with dynamic column overlays:
- - Toggle between 'keras' and 'torch' pipelines
- - Enter symbols, date range, seq_len, epochs, batch_size
- - Automatically loads local CSVs from /stockdata/[SYMBOL]/[SYMBOL].csv if present,
-   otherwise falls back to API fetch via neuroprin.data.load_price_data
- - Computes indicators, displays raw data table
- - Dynamically select any columns (raw or generated) to overlay on the price chart
- - Lists output files and allows opening them
-"""
-
-import os
-import tkinter as tk
-from tkinter import ttk, messagebox
+import sys
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import seaborn as sns
 
-from neuroprin.train import run_keras_models, run_pytorch_pipeline
-from neuroprin.data import load_price_data, compute_indicators
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from hmmlearn.hmm import GaussianHMM
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton,
+    QFileDialog, QLabel, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox,
+    QTabWidget, QTextEdit, QHBoxLayout, QTableWidget, QTableWidgetItem
+)
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+from neuroprin.data import (
+    load_price_data,
+    compute_indicators,
+    prune_data,
+    compute_fourier_resonance,
+    compute_rqa_metrics,
+    prepare_sequences_with_prin_plus_plus
+)
+from neuroprin.models import BaselineLSTM, PRIN_LSTM, DPRIN_LSTM, NeuroPRINv4
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
 
 
-class NeuroPRINGUI(tk.Tk):
+class NeuroPRINGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("NeuroPRIN Demo GUI")
-        self.geometry("1200x800")
-        self._build_widgets()
+        self.setWindowTitle("NeuroPRIN Studio Pro v4")
         self.df = None
+        self.initUI()
 
-    def _build_widgets(self):
-        # Control panel
-        ctrl = ttk.Frame(self)
-        ctrl.grid(row=0, column=0, sticky="nw", padx=10, pady=10)
+    def initUI(self):
+        widget = QWidget()
+        layout = QVBoxLayout()
 
-        # Pipeline selector
-        ttk.Label(ctrl, text="Pipeline:").grid(row=0, column=0, sticky="w")
-        self.pipeline_var = tk.StringVar(value="torch")
-        ttk.Combobox(ctrl, textvariable=self.pipeline_var,
-                     values=["keras", "torch"], state="readonly")\
-            .grid(row=0, column=1, sticky="ew")
+        self.file_label = QLabel("Select CSV Dataset:")
+        layout.addWidget(self.file_label)
+        self.load_button = QPushButton("Browse")
+        self.load_button.clicked.connect(self.load_csv)
+        layout.addWidget(self.load_button)
 
-        # Symbols entry
-        ttk.Label(ctrl, text="Symbols (comma-separated):")\
-            .grid(row=1, column=0, sticky="w")
-        self.symbols_entry = ttk.Entry(ctrl)
-        self.symbols_entry.grid(row=1, column=1, sticky="ew")
+        self.feature_label = QLabel("Select Features:")
+        layout.addWidget(self.feature_label)
+        self.feature_list = QListWidget()
+        self.feature_list.setSelectionMode(QListWidget.MultiSelection)
+        layout.addWidget(self.feature_list)
 
-        # Date range
-        ttk.Label(ctrl, text="Start Date (YYYY-MM-DD):")\
-            .grid(row=2, column=0, sticky="w")
-        self.start_entry = ttk.Entry(ctrl)
-        self.start_entry.grid(row=2, column=1, sticky="ew")
-        ttk.Label(ctrl, text="End Date (YYYY-MM-DD):")\
-            .grid(row=3, column=0, sticky="w")
-        self.end_entry = ttk.Entry(ctrl)
-        self.end_entry.grid(row=3, column=1, sticky="ew")
+        self.target_label = QLabel("Target:")
+        layout.addWidget(self.target_label)
+        self.target_box = QComboBox()
+        layout.addWidget(self.target_box)
 
-        # Sequence length
-        ttk.Label(ctrl, text="Seq Length:").grid(row=4, column=0, sticky="w")
-        self.seq_len_spin = ttk.Spinbox(ctrl, from_=1, to=200, increment=1)
-        self.seq_len_spin.set("20")
-        self.seq_len_spin.grid(row=4, column=1, sticky="ew")
+        self.model_label = QLabel("Model:")
+        layout.addWidget(self.model_label)
+        self.model_box = QComboBox()
+        self.model_box.addItems(["BaselineLSTM", "PRIN_LSTM", "DPRIN_LSTM", "NeuroPRINv4"])
+        layout.addWidget(self.model_box)
 
-        # Epochs
-        ttk.Label(ctrl, text="Epochs:").grid(row=5, column=0, sticky="w")
-        self.epochs_spin = ttk.Spinbox(ctrl, from_=1, to=1000, increment=1)
-        self.epochs_spin.set("50")
-        self.epochs_spin.grid(row=5, column=1, sticky="ew")
+        self.epoch_label = QLabel("Epochs:")
+        layout.addWidget(self.epoch_label)
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setMaximum(100000)
+        self.epochs_spin.setValue(50)
+        layout.addWidget(self.epochs_spin)
 
-        # Batch size
-        ttk.Label(ctrl, text="Batch Size:").grid(row=6, column=0, sticky="w")
-        self.batch_spin = ttk.Spinbox(ctrl, from_=1, to=1024, increment=1)
-        self.batch_spin.set("64")
-        self.batch_spin.grid(row=6, column=1, sticky="ew")
+        self.lr_label = QLabel("Learning Rate:")
+        layout.addWidget(self.lr_label)
+        self.lr_spin = QDoubleSpinBox()
+        self.lr_spin.setValue(0.001)
+        self.lr_spin.setDecimals(6)
+        layout.addWidget(self.lr_spin)
 
-        # Run button
-        self.run_button = ttk.Button(ctrl, text="Run Pipeline",
-                                     command=self._on_run)
-        self.run_button.grid(row=7, column=0, columnspan=2, pady=10)
+        self.batch_label = QLabel("Batch Size:")
+        layout.addWidget(self.batch_label)
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setValue(64)
+        layout.addWidget(self.batch_spin)
 
-        # Column selector for overlays
-        ttk.Label(ctrl, text="Select columns to overlay:")\
-            .grid(row=8, column=0, columnspan=2, sticky="w", pady=(10,0))
-        self.columns_listbox = tk.Listbox(ctrl, selectmode="multiple", height=10)
-        self.columns_listbox.grid(row=9, column=0, columnspan=2, sticky="nsew")
-        ctrl.rowconfigure(9, weight=1)
+        self.seq_label = QLabel("Sequence Length:")
+        layout.addWidget(self.seq_label)
+        self.seq_spin = QSpinBox()
+        self.seq_spin.setValue(10)
+        layout.addWidget(self.seq_spin)
 
-        # Notebook for raw data and chart
-        self.notebook = ttk.Notebook(self)
-        self.notebook.grid(row=0, column=1, rowspan=12,
-                           sticky="nsew", padx=10, pady=10)
+        self.regime_label = QLabel("HMM Regimes:")
+        layout.addWidget(self.regime_label)
+        self.regime_spin = QSpinBox()
+        self.regime_spin.setValue(3)
+        layout.addWidget(self.regime_spin)
 
-        # Raw data tab
-        self.raw_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.raw_frame, text="Raw Data")
-        self.tree = ttk.Treeview(self.raw_frame)
-        self.tree.pack(expand=True, fill="both")
+        self.train_button = QPushButton("Run Training")
+        self.train_button.clicked.connect(self.run_training)
+        layout.addWidget(self.train_button)
 
-        # Chart tab
-        self.chart_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.chart_frame, text="Chart")
-        self.fig, self.ax = plt.subplots(figsize=(6,4))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.chart_frame)
-        self.canvas.get_tk_widget().pack(expand=True, fill="both")
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
 
-        # Output files list
-        ttk.Label(self, text="Output Files:")\
-            .grid(row=12, column=0, sticky="w", padx=10)
-        self.files_list = tk.Listbox(self)
-        self.files_list.grid(row=13, column=0, columnspan=2,
-                             sticky="ew", padx=10, pady=(0,10))
-        ttk.Button(self, text="Open File", command=self._on_open_file)\
-            .grid(row=13, column=2, sticky="e", padx=10, pady=(0,10))
+        self.loss_fig, self.loss_ax = plt.subplots()
+        self.loss_canvas = FigureCanvas(self.loss_fig)
+        self.tabs.addTab(self.loss_canvas, "Loss")
 
-        # Configure resizing behavior
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(13, weight=1)
+        self.summary_text = QTextEdit()
+        self.summary_text.setReadOnly(True)
+        self.tabs.addTab(self.summary_text, "Data Summary")
 
-    def _on_run(self):
-        # Gather inputs
-        symbols = [s.strip() for s in self.symbols_entry.get().split(",") if s.strip()]
-        start = self.start_entry.get().strip()
-        end = self.end_entry.get().strip()
-        try:
-            seq_len = int(self.seq_len_spin.get())
-            epochs = int(self.epochs_spin.get())
-            batch_size = int(self.batch_spin.get())
-        except ValueError:
-            messagebox.showerror(
-                "Input Error",
-                "Sequence length, epochs, and batch size must be integers."
+        self.heatmap_fig, self.heatmap_ax = plt.subplots()
+        self.heatmap_canvas = FigureCanvas(self.heatmap_fig)
+        self.tabs.addTab(self.heatmap_canvas, "Feature Correlation")
+
+        # --- predictions panel with chart + table ---
+        self.pred_widget = QWidget()
+        self.pred_layout = QHBoxLayout(self.pred_widget)
+
+        self.pred_fig, self.pred_ax = plt.subplots()
+        self.pred_canvas = FigureCanvas(self.pred_fig)
+        self.pred_layout.addWidget(self.pred_canvas)
+
+        self.pred_table = QTableWidget()
+        self.pred_layout.addWidget(self.pred_table)
+
+        self.tabs.addTab(self.pred_widget, "Predictions")
+
+        widget.setLayout(layout)
+        self.setCentralWidget(widget)
+
+    def load_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select CSV File", "", "CSV Files (*.csv)")
+        if not path: return
+        self.df = load_price_data(path)
+        self.df = compute_indicators(self.df)
+        valid_cols = self.df.select_dtypes(include=[np.number, 'object']).columns.tolist()
+        self.feature_list.clear()
+        self.feature_list.addItems(valid_cols)
+        self.target_box.clear()
+        self.target_box.addItems(valid_cols)
+        self.display_summary()
+        self.display_correlation()
+
+    def display_summary(self):
+        summary = self.df.describe(include='all').T
+        summary['Missing'] = self.df.isna().sum()
+        self.summary_text.setText(str(summary))
+
+    def display_correlation(self):
+        num_df = self.df.select_dtypes(include=[np.number])
+        self.heatmap_ax.clear()
+        sns.heatmap(num_df.corr(), ax=self.heatmap_ax, cmap='coolwarm', annot=False)
+        self.heatmap_canvas.draw()
+
+    def run_training(self):
+        selected = [i.text() for i in self.feature_list.selectedItems()]
+        target = self.target_box.currentText()
+        if not selected or not target: return
+        df_train = self.df[selected + [target]].dropna()
+
+        model_type = self.model_box.currentText()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        hidden_size = 64
+        output_size = 1
+
+        if model_type == 'NeuroPRINv4':
+            seq_len = self.seq_spin.value()
+            n_regimes = self.regime_spin.value()
+
+            df_p = prune_data(df_train)
+            df_r = compute_fourier_resonance(df_p, window_size=seq_len)
+            df_q = compute_rqa_metrics(df_r, window_size=seq_len)
+
+            X, y, chaos_arr, rec_arr, regimes_arr, _ = prepare_sequences_with_prin_plus_plus(
+                {'_': df_q}, seq_length=seq_len, n_features=len(selected), n_regimes=n_regimes
             )
+
+            split = int(len(X) * 0.8)
+            X_train, X_val = X[:split], X[split:]
+            y_train, y_val = y[:split], y[split:]
+            chaos_train, chaos_val = chaos_arr[:split], chaos_arr[split:]
+            reg_train, reg_val = regimes_arr[:split], regimes_arr[split:]
+
+            y_scaler = StandardScaler()
+            y_train_scaled = y_scaler.fit_transform(y_train.reshape(-1, 1))
+            y_val_scaled = y_scaler.transform(y_val.reshape(-1, 1))
+
+            model = NeuroPRINv4(input_size=X.shape[-1], seq_len=seq_len, num_regimes=n_regimes)
+            X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+            X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
+            y_train_t = torch.tensor(y_train_scaled, dtype=torch.float32).to(device)
+            y_val_t = torch.tensor(y_val_scaled, dtype=torch.float32).to(device)
+            chaos_train_t = torch.tensor(chaos_train, dtype=torch.float32).to(device)
+            chaos_val_t = torch.tensor(chaos_val, dtype=torch.float32).to(device)
+            reg_train_t = torch.tensor(reg_train, dtype=torch.long).to(device)
+            reg_val_t = torch.tensor(reg_val, dtype=torch.long).to(device)
+
+            optimizer = optim.Adam(model.parameters(), lr=self.lr_spin.value())
+            criterion = nn.MSELoss()
+
+            history = {'loss': [], 'val_loss': []}
+            for ep in range(self.epochs_spin.value()):
+                model.train()
+                optimizer.zero_grad()
+                out = model(X_train_t, chaos_train_t, reg_train_t)
+                loss = criterion(out, y_train_t)
+                loss.backward()
+                optimizer.step()
+                model.eval()
+                with torch.no_grad():
+                    val_out = model(X_val_t, chaos_val_t, reg_val_t)
+                    val_loss = criterion(val_out, y_val_t)
+                history['loss'].append(loss.item())
+                history['val_loss'].append(val_loss.item())
+
+            self.plot_loss(history)
+            self.plot_predictions(model, X_val_t, y_val_t, chaos_val_t, reg_val_t, scaler_y=y_scaler)
             return
 
-        pipeline = self.pipeline_var.get()
-        output_dir = f"{pipeline}_gui_runs"
-        os.makedirs(output_dir, exist_ok=True)
+        # Standard models:
+        X = pd.get_dummies(df_train[selected], drop_first=True).values.astype(np.float32)
+        y = df_train[target].values.astype(np.float32).reshape(-1, 1)
+        split = int(len(X) * 0.8)
+        X_train, X_val = X[:split], X[split:]
+        y_train, y_val = y[:split], y[split:]
 
-        # Run selected pipeline
-        try:
-            if pipeline == "keras":
-                run_keras_models(
-                    symbols=symbols,
-                    start_date=start,
-                    end_date=end,
-                    seq_len=seq_len,
-                    test_size=0.2,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    output_dir=output_dir,
-                )
+        input_size = X.shape[1]
+        model = {
+            'BaselineLSTM': BaselineLSTM,
+            'PRIN_LSTM': PRIN_LSTM,
+            'DPRIN_LSTM': DPRIN_LSTM
+        }[model_type](input_size, hidden_size, output_size)
+        model.to(device)
+
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_val = scaler.transform(X_val)
+        y_scaler = StandardScaler()
+        y_train = y_scaler.fit_transform(y_train)
+        y_val = y_scaler.transform(y_val)
+
+        X_train_t = torch.tensor(X_train, dtype=torch.float32).unsqueeze(1).to(device)
+        X_val_t = torch.tensor(X_val, dtype=torch.float32).unsqueeze(1).to(device)
+        y_train_t = torch.tensor(y_train, dtype=torch.float32).to(device)
+        y_val_t = torch.tensor(y_val, dtype=torch.float32).to(device)
+
+        optimizer = optim.Adam(model.parameters(), lr=self.lr_spin.value())
+        criterion = nn.MSELoss()
+
+        history = {'loss': [], 'val_loss': []}
+        for ep in range(self.epochs_spin.value()):
+            model.train()
+            optimizer.zero_grad()
+            out = model(X_train_t)
+            loss = criterion(out, y_train_t)
+            loss.backward()
+            optimizer.step()
+            model.eval()
+            with torch.no_grad():
+                val_loss = criterion(model(X_val_t), y_val_t)
+            history['loss'].append(loss.item())
+            history['val_loss'].append(val_loss.item())
+
+        self.plot_loss(history)
+        self.plot_predictions(model, X_val_t, y_val_t, scaler_y=y_scaler)
+
+    def plot_loss(self, history):
+        self.loss_ax.clear()
+        self.loss_ax.plot(history['loss'], label='Train')
+        self.loss_ax.plot(history['val_loss'], label='Val')
+        self.loss_ax.legend()
+        self.loss_ax.set_title('Training Loss')
+        self.loss_fig.tight_layout()
+        self.loss_canvas.draw()
+
+    def plot_predictions(self, model, X_val, y_val, chaos=None, regime=None, scaler_y=None):
+        model.eval()
+        with torch.no_grad():
+            if hasattr(model, 'forward') and chaos is not None:
+                y_pred = model(X_val, chaos, regime).cpu().numpy()
             else:
-                run_pytorch_pipeline(
-                    symbols=symbols,
-                    start_date=start,
-                    end_date=end,
-                    seq_len=seq_len,
-                    test_size=0.2,
-                    batch_size=batch_size,
-                    epochs=epochs,
-                    device="cpu",
-                    output_dir=output_dir,
-                )
-        except Exception as e:
-            messagebox.showerror("Pipeline Error", str(e))
-            return
+                y_pred = model(X_val).cpu().numpy()
 
-        # Load and prepare data
-        self.df = self._load_local_or_api(symbols, start, end)
-        self.df = compute_indicators(self.df).reset_index()
+        y_pred_rescaled = scaler_y.inverse_transform(y_pred)
+        y_val_rescaled = scaler_y.inverse_transform(y_val.cpu().numpy())
 
-        # Update UI elements
-        self._show_raw_data(self.df)
-        self._populate_columns(self.df)
-        self._plot_selected_columns()
+        mae = mean_absolute_error(y_val_rescaled, y_pred_rescaled)
+        rmse = mean_squared_error(y_val_rescaled, y_pred_rescaled, squared=False)
+        r2 = r2_score(y_val_rescaled, y_pred_rescaled)
 
-        # List output files
-        self._list_output_files(output_dir)
+        self.pred_ax.clear()
+        self.pred_ax.plot(y_val_rescaled, label='Actual')
+        self.pred_ax.plot(y_pred_rescaled, label='Predicted')
+        self.pred_ax.set_title(f'Predictions (MAE={mae:.2f}, RMSE={rmse:.2f}, R²={r2:.3f})')
+        self.pred_ax.legend()
+        self.pred_fig.tight_layout()
+        self.pred_canvas.draw()
 
-    def _load_local_or_api(self, symbols, start, end):
-        frames = []
-        for sym in symbols:
-            local_file = os.path.join("stockdata", sym, f"{sym}.csv")
-            if os.path.exists(local_file):
-                df = pd.read_csv(local_file, parse_dates=["Date"])
-            else:
-                df = load_price_data([sym], start, end)
-            df["Symbol"] = sym
-            frames.append(df)
-        return pd.concat(frames, ignore_index=True)
+        self.pred_table.clear()
+        self.pred_table.setRowCount(len(y_val_rescaled))
+        self.pred_table.setColumnCount(3)
+        self.pred_table.setHorizontalHeaderLabels(["Index", "Actual", "Predicted"])
 
-    def _show_raw_data(self, df: pd.DataFrame):
-        self.tree.delete(*self.tree.get_children())
-        self.tree["columns"] = list(df.columns)
-        self.tree["show"] = "headings"
-        for col in df.columns:
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=100, anchor="center")
-        for _, row in df.iterrows():
-            self.tree.insert("", "end", values=list(row))
+        for i in range(len(y_val_rescaled)):
+            self.pred_table.setItem(i, 0, QTableWidgetItem(str(i)))
+            self.pred_table.setItem(i, 1, QTableWidgetItem(f"{y_val_rescaled[i][0]:.3f}"))
+            self.pred_table.setItem(i, 2, QTableWidgetItem(f"{y_pred_rescaled[i][0]:.3f}"))
 
-    def _populate_columns(self, df: pd.DataFrame):
-        self.columns_listbox.delete(0, tk.END)
-        for col in df.columns:
-            self.columns_listbox.insert(tk.END, col)
+        self.pred_table.resizeColumnsToContents()
 
-    def _plot_selected_columns(self):
-        if self.df is None:
-            return
-        self.ax.clear()
-        selected_indices = self.columns_listbox.curselection()
-        for idx in selected_indices:
-            col = self.columns_listbox.get(idx)
-            if col in ("Date", "Symbol"):
-                continue
-            for sym in self.df["Symbol"].unique():
-                sub = self.df[self.df["Symbol"] == sym]
-                self.ax.plot(sub["Date"], sub[col], label=f"{sym} {col}")
-        self.ax.set_title("Selected Data Overlays")
-        self.ax.legend(loc="upper left", fontsize="small")
-        self.canvas.draw()
 
-    def _list_output_files(self, output_dir):
-        self.files_list.delete(0, tk.END)
-        for fname in sorted(os.listdir(output_dir)):
-            path = os.path.join(output_dir, fname)
-            self.files_list.insert(tk.END, path)
-
-    def _on_open_file(self):
-        sel = self.files_list.curselection()
-        if not sel or not hasattr(self, "files_list"):
-            return
-        path = self.files_list.get(sel[0])
-        if os.name == "nt":
-            os.startfile(path)
-        else:
-            os.system(f'xdg-open "{path}"')
-
-if __name__ == "__main__":
-    app = NeuroPRINGUI()
-    app.mainloop()
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = NeuroPRINGUI()
+    window.show()
+    sys.exit(app.exec_())

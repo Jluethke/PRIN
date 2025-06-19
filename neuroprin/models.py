@@ -20,6 +20,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
 
 
 class FeatureResonanceGating(nn.Module):
@@ -140,7 +145,70 @@ class BaselineLSTM(nn.Module):
         out, _ = self.lstm(x)
         residual = self.residual_fc(x[:, -1, :])
         return self.refine_fc(out[:, -1, :] + residual)
+class LinearRegressionModel:
+    def __init__(self):
+        self.model = LinearRegression()
 
+    def fit(self, X_train, y_train):
+        self.model.fit(X_train, y_train)
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class RandomForestModel:
+    def __init__(self, n_estimators=100, max_depth=None):
+        self.model = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42)
+
+    def fit(self, X_train, y_train):
+        self.model.fit(X_train, y_train)
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class XGBoostModel:
+    def __init__(self):
+        self.model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+
+    def fit(self, X_train, y_train):
+        self.model.fit(X_train, y_train)
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class SupportVectorModel:
+    def __init__(self):
+        self.model = SVR(kernel='rbf', C=1.0, epsilon=0.1)
+
+    def fit(self, X_train, y_train):
+        self.model.fit(X_train, y_train.ravel())
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class KNNModel:
+    def __init__(self, n_neighbors=5):
+        self.model = KNeighborsRegressor(n_neighbors=n_neighbors)
+
+    def fit(self, X_train, y_train):
+        self.model.fit(X_train, y_train)
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class GradientBoostingModel:
+    def __init__(self):
+        self.model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+
+    def fit(self, X_train, y_train):
+        self.model.fit(X_train, y_train)
+
+    def predict(self, X):
+        return self.model.predict(X)
 
 class SelfAttention(nn.Module):
     """Multi-Head Self-Attention with Adaptive Head Importance."""

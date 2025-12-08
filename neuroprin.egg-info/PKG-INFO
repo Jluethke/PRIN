@@ -1,0 +1,39 @@
+Metadata-Version: 2.4
+Name: neuroprin
+Version: 0.1.0
+Summary: NeuroPRIN: Pruned Resonance Inference Network for time-series trading
+Home-page: https://github.com/yourusername/neuroprin
+Author: Your Name
+Author-email: you@example.com
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+Requires-Dist: numpy==1.26.4
+Requires-Dist: pandas==2.2.2
+Requires-Dist: yfinance==0.2.37
+Requires-Dist: pandas_ta==0.3.14b0
+Requires-Dist: gym==0.26.2
+Requires-Dist: tensorflow==2.16.1
+Requires-Dist: keras==3.2.0
+Requires-Dist: keras-core==0.1.7
+Requires-Dist: torch==2.2.2
+Requires-Dist: optuna==3.6.1
+Requires-Dist: scikit-learn==1.4.2
+Requires-Dist: hmmlearn==0.3.2
+Requires-Dist: xgboost==2.0.3
+Requires-Dist: scipy==1.13.1
+Requires-Dist: matplotlib==3.9.0
+Requires-Dist: paramiko==3.4.0
+Requires-Dist: ipaddress==1.0.23
+Requires-Dist: rich==13.7.1
+Requires-Dist: pyqt5==5.15.10
+Requires-Dist: seaborn
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

@@ -1,0 +1,2 @@
+[console_scripts]
+neuroprin-demo = main:main

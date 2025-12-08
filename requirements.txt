@@ -1,0 +1,39 @@
+# Core Data / ML
+numpy==1.26.4
+pandas==2.2.2
+
+# Stock data & Indicators
+yfinance==0.2.37
+pandas_ta==0.3.14b0
+
+# Reinforcement learning
+gym==0.26.2
+
+# Deep Learning frameworks
+tensorflow==2.16.1
+keras==3.2.0
+keras-core==0.1.7
+torch==2.2.2
+
+# Hyperparameter search
+optuna==3.6.1
+
+# Classical ML
+scikit-learn==1.4.2
+hmmlearn==0.3.2
+xgboost==2.0.3
+scipy==1.13.1
+
+# Plotting
+matplotlib==3.9.0
+
+# Networking
+paramiko==3.4.0
+ipaddress==1.0.23
+
+# Logging
+rich==13.7.1
+
+# GUI — fully working!
+pyqt5==5.15.10
+seaborn

@@ -433,7 +433,7 @@
 # Install dependencies
 
 # pip install -r requirements.txt
-
+# pip install PandasTA-v0.3.14b source code.tar.gz
 # 
 
 # 
